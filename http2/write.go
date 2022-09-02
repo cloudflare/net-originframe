@@ -328,6 +328,19 @@ func (wu writeWindowUpdate) writeFrame(ctx writeContext) error {
 	return ctx.Framer().WriteWindowUpdate(wu.streamID, wu.n)
 }
 
+type writeOrigin struct {
+	origins          []string
+	originBodyLength int
+}
+
+func (wo writeOrigin) staysWithinBuffer(max int) bool {
+	return frameHeaderLen+wo.originBodyLength <= max
+}
+
+func (wo writeOrigin) writeFrame(ctx writeContext) error {
+	return ctx.Framer().WriteOrigin(wo.origins)
+}
+
 // encodeHeaders encodes an http.Header. If keys is not nil, then (k, h[k])
 // is encoded only if k is in keys.
 func encodeHeaders(enc *hpack.Encoder, h http.Header, keys []string) {

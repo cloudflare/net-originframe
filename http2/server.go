@@ -948,6 +948,8 @@ func (sc *serverConn) serve() {
 				}
 			case *startPushRequest:
 				sc.startPush(v)
+			case *PushOriginRequest:
+				sc.pushOrigin(v)
 			default:
 				panic(fmt.Sprintf("unexpected type %T", v))
 			}
@@ -2847,6 +2849,51 @@ var (
 
 var _ http.Pusher = (*responseWriter)(nil)
 
+var _ http.OriginPusher = (*responseWriter)(nil)
+
+func (w *responseWriter) OriginPush(origins []string) error {
+	st := w.rws.stream
+	sc := st.sc
+	sc.serveG.checkNotOn()
+	tLen := 0
+	checkedOrigins := make([]string, 0)
+	for _, origin := range origins {
+		u, err := url.Parse(origin)
+		if err != nil {
+			return err
+		}
+		ts := url.URL{Scheme: "https", Host: u.Host}
+		if ts.String() != u.String() {
+			continue
+		}
+		tLen += 2 + len(ts.String())
+		checkedOrigins = append(checkedOrigins, ts.String())
+	}
+	msg := &PushOriginRequest{
+		origins:          checkedOrigins,
+		originBodyLength: tLen,
+		done:             errChanPool.Get().(chan error),
+	}
+
+	select {
+	case <-sc.doneServing:
+		return errClientDisconnected
+	case <-st.cw:
+		return errStreamClosed
+	case sc.serveMsgCh <- msg:
+	}
+
+	select {
+	case <-sc.doneServing:
+		return errClientDisconnected
+	case <-st.cw:
+		return errStreamClosed
+	case err := <-msg.done:
+		errChanPool.Put(msg.done)
+		return err
+	}
+}
+
 func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
 	st := w.rws.stream
 	sc := st.sc
@@ -3033,6 +3080,25 @@ func (sc *serverConn) startPush(msg *startPushRequest) {
 		},
 		stream: msg.parent,
 		done:   msg.done,
+	})
+}
+
+type PushOriginRequest struct {
+	parent           *stream
+	origins          []string
+	done             chan error
+	originBodyLength int
+}
+
+func (sc *serverConn) pushOrigin(msg *PushOriginRequest) {
+	sc.serveG.check()
+
+	sc.writeFrame(FrameWriteRequest{
+		write: writeOrigin{
+			origins:          msg.origins,
+			originBodyLength: msg.originBodyLength,
+		},
+		done: msg.done,
 	})
 }
 

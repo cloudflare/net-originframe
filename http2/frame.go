@@ -37,6 +37,7 @@ const (
 	FrameGoAway       FrameType = 0x7
 	FrameWindowUpdate FrameType = 0x8
 	FrameContinuation FrameType = 0x9
+	FrameOrigin       FrameType = 0xC
 )
 
 var frameName = map[FrameType]string{
@@ -50,6 +51,7 @@ var frameName = map[FrameType]string{
 	FrameGoAway:       "GOAWAY",
 	FrameWindowUpdate: "WINDOW_UPDATE",
 	FrameContinuation: "CONTINUATION",
+	FrameOrigin:       "ORIGIN",
 }
 
 func (t FrameType) String() string {
@@ -135,6 +137,7 @@ var frameParsers = map[FrameType]frameParser{
 	FrameGoAway:       parseGoAwayFrame,
 	FrameWindowUpdate: parseWindowUpdateFrame,
 	FrameContinuation: parseContinuationFrame,
+	FrameOrigin:       parseOriginFrame,
 }
 
 func typeFrameParser(t FrameType) frameParser {
@@ -1265,6 +1268,83 @@ func (f *Framer) WriteContinuation(streamID uint32, endHeaders bool, headerBlock
 	return f.endWrite()
 }
 
+// An OriginFrame is used to assert authority to serve a domain.
+// See https://datatracker.ietf.org/doc/html/rfc8336
+type OriginFrame struct {
+	FrameHeader
+	originEntries []originEntry
+}
+
+type originEntry struct {
+	originLen   uint16
+	asciiOrigin string
+}
+
+func parseOriginFrame(_ *frameCache, fh FrameHeader, countError func(string), p []byte) (Frame, error) {
+	if fh.StreamID != 0 {
+		if VerboseLogs {
+			log.Printf("http2: ORIGIN Frame with non-zero stream ID: %d", fh.StreamID)
+		}
+		countError("frame_origin_nonzero_streamid")
+		return nil, connError{ErrCodeProtocol, "ORIGIN Frame with non-zero stream ID"}
+	}
+
+	if fh.Flags != 0 {
+		if VerboseLogs {
+			log.Printf("http2: ORIGIN Frame with unsupported flags: %d", fh.Flags)
+		}
+		countError("frame_origin_unsupported_flag")
+		return nil, connError{ErrCodeProtocol, "Unsupported flags set"}
+	}
+
+	remain := p
+	origins := make([]originEntry, 0)
+
+	for len(remain) > 0 {
+		var v uint16
+		var err error
+		remain, v, err = readUint16(remain)
+		if err != nil {
+			if VerboseLogs {
+				log.Printf("http2: ORIGIN Frame with unexpected EOF")
+			}
+			countError("frame_origin_eof")
+			return nil, connError{ErrCodeProtocol, "Unexpected EOF in ORIGIN Frame"}
+		}
+		if len(remain) < int(v) {
+			if VerboseLogs {
+				log.Printf("http2: ORIGIN Frame failed to parse correctly")
+			}
+			countError("frame_origin_parse_err")
+			return nil, connError{ErrCodeProtocol, "Parse Error for ORIGIN Frame"}
+		}
+
+		origin := string(remain[:v])
+		remain = remain[v:]
+
+		origins = append(origins, originEntry{v, origin})
+	}
+	return &OriginFrame{fh, origins}, nil
+}
+
+func readUint16(p []byte) (remain []byte, v uint16, err error) {
+	if len(p) < 2 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	return p[2:], binary.BigEndian.Uint16(p[:2]), nil
+}
+
+// WriteOrigin writes a single ORIGIN frame.
+// It will only perform one write
+func (f *Framer) WriteOrigin(origins []string) error {
+	f.startWrite(FrameOrigin, 0, 0)
+	for _, origin := range origins {
+		f.writeUint16(uint16(len(origin)))
+		f.wbuf = append(f.wbuf, []byte(origin)...)
+	}
+	return f.endWrite()
+}
+
 // A PushPromiseFrame is used to initiate a server stream.
 // See https://httpwg.org/specs/rfc7540.html#rfc.section.6.6
 type PushPromiseFrame struct {
@@ -1644,6 +1724,8 @@ func summarizeFrame(f Frame) string {
 			f.LastStreamID, f.ErrCode, f.debugData)
 	case *RSTStreamFrame:
 		fmt.Fprintf(&buf, " ErrCode=%v", f.ErrCode)
+	case *OriginFrame:
+		fmt.Fprintf(&buf, " Origins=%v", f.originEntries)
 	}
 	return buf.String()
 }
